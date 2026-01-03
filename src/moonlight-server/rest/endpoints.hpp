@@ -20,6 +20,7 @@
 #include <state/sessions.hpp>
 #include <state/utils.hpp>
 #include <utility>
+#include <random>
 
 namespace endpoints {
 
@@ -373,23 +374,66 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                         const state::PairedClient &current_client,
                         immer::box<state::AppState> state,
                         const events::App &run_app) {
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
-  moonlight::DisplayMode display_mode = {std::stoi(display_mode_str[0].data()),
-                                         std::stoi(display_mode_str[1].data()),
-                                         std::stoi(display_mode_str[2].data()),
+  // Parse display mode - format should be WIDTHxHEIGHTxFPS (e.g., "1920x1080x60")
+  // Default to 1920x1080x60 if not provided or malformed
+  auto mode_str = get_header(headers, "mode").value_or("1920x1080x60");
+  auto display_mode_str = utils::split(mode_str, 'x');
+
+  int width = 1920, height = 1080, fps = 60;
+  if (display_mode_str.size() >= 3) {
+    try {
+      width = std::stoi(display_mode_str[0].data());
+      height = std::stoi(display_mode_str[1].data());
+      fps = std::stoi(display_mode_str[2].data());
+    } catch (...) {
+      logs::log(logs::warning, "[HTTP] Invalid mode format '{}', using defaults 1920x1080x60", mode_str);
+    }
+  } else if (display_mode_str.size() == 1 && mode_str != "1920x1080x60") {
+    // mode=1 means streaming mode, not resolution - use defaults
+    logs::log(logs::debug, "[HTTP] Mode '{}' is not resolution format, using defaults 1920x1080x60", mode_str);
+  }
+
+  moonlight::DisplayMode display_mode = {width, height, fps,
                                          state->config->support_hevc,
                                          state->config->support_av1};
 
   auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
   int channelCount = surround_info & (0xffff /* last 16 bits */);
 
+  // rikey and rikeyid are AES encryption keys for the stream
+  // If not provided, generate random ones (less secure but functional)
+  auto rikey = get_header(headers, "rikey");
+  auto rikeyid = get_header(headers, "rikeyid");
+
+  std::string aes_key, aes_iv;
+  if (rikey && rikeyid) {
+    aes_key = rikey.value();
+    aes_iv = rikeyid.value();
+  } else {
+    // Generate random keys for clients that don't provide them
+    logs::log(logs::warning, "[HTTP] rikey/rikeyid not provided, generating random encryption keys");
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> hex_dist(0, 15);
+    auto gen_hex = [&](int len) {
+      std::string result;
+      result.reserve(len);
+      for (int i = 0; i < len; i++) {
+        result += "0123456789abcdef"[hex_dist(gen)];
+      }
+      return result;
+    };
+    aes_key = gen_hex(32);  // 128-bit key as hex
+    aes_iv = gen_hex(16);   // IV
+  }
+
   auto base_session = create_stream_session(state,
                                             run_app,
                                             current_client,
                                             display_mode,
                                             channelCount,
-                                            get_header(headers, "rikey").value(),
-                                            get_header(headers, "rikeyid").value());
+                                            aes_key,
+                                            aes_iv);
 
   base_session->ip = client_ip;
   return std::move(base_session);
